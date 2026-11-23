@@ -109,6 +109,15 @@ constexpr HRESULT E_DSTORAGE_INVALID_STAGING_BUFFER_SIZE = static_cast<HRESULT>(
 constexpr HRESULT E_DSTORAGE_INVALID_FENCE = static_cast<HRESULT>(0x89240022L);
 constexpr HRESULT E_DSTORAGE_INVALID_STATUS_ARRAY = static_cast<HRESULT>(0x89240023L);
 constexpr HRESULT E_DSTORAGE_INVALID_MEMORY_QUEUE_PRIORITY = static_cast<HRESULT>(0x89240024L);
+// The decompression failures (adapted from upstream PR #7180, KkelebekK, commit 00551ba0, GPL-3.0).
+// E_DSTORAGE_DECOMPRESSION_ERROR ("a generic error has happened during decompression") is on the public DirectStorage
+// constants page. The three zlib codes have no public description: their names and values are those of the
+// header-generated bindings of the `direct-storage` crate 0.5.1 (docs/directstorage.md "Sources"). Which stream fault
+// the console reports with each is inferred from the names only (PARITY_FAIL read as the Adler-32 check).
+constexpr HRESULT E_DSTORAGE_DECOMPRESSION_ERROR = static_cast<HRESULT>(0x89240030L);
+constexpr HRESULT E_DSTORAGE_ZLIB_BAD_HEADER = static_cast<HRESULT>(0x89240031L);
+constexpr HRESULT E_DSTORAGE_ZLIB_BAD_DATA = static_cast<HRESULT>(0x89240032L);
+constexpr HRESULT E_DSTORAGE_ZLIB_PARITY_FAIL = static_cast<HRESULT>(0x89240033L);
 
 // ---- Structures ---------------------------------------------------------------------------------------------------
 

@@ -20,6 +20,9 @@ upstream PR #4348 ([UPSTREAM.md](../UPSTREAM.md#directstorage-factory)).
 | File API | primary documentation; ordinal sourced | Microsoft's Xbox `IDStorageFileX` exposes `Close()` and `HANDLE GetHandle()`. The PR places these at slots 3 and 4; the synthetic test pins this table, without claiming a local retail slot measurement |
 | Queue inheritance | primary documentation; ordinals sourced | Microsoft's `IDStorageQueueX` includes `EnqueueSignal`; X1 adds `EnqueueSetEvent`, and X2 adds `Query1`. This matches the PR's inheritance, not OpenScarlett's swapped signal/event methods or additional slots 14-15 |
 | Struct layouts, `E_DSTORAGE_*` values, capacity bounds | sourced | the GDK reference and the PC `dstorage.h`/`dstorageerr.h` 1.3.0, pinned with `static_assert` in `dstorage_xs_abi.h` |
+| `E_DSTORAGE_DECOMPRESSION_ERROR` `0x89240030` | sourced | Microsoft's public DirectStorage constants page ("a generic error during decompression") |
+| `E_DSTORAGE_ZLIB_BAD_HEADER` / `_BAD_DATA` / `_PARITY_FAIL` `0x89240031`-`33` | values sourced; **meaning inferred** | names and values from the header-generated bindings of the `direct-storage` crate 0.5.1 (as recorded by PR #7180); no public description. Header / deflate data / Adler-32 is a reading of the names, not a measurement |
+| zlib `DestinationSize` larger than `SourceSize`; zlib `FileOffset` 16-byte aligned | sourced | `E_DSTORAGE_INVALID_DESTINATION_SIZE`'s description and `DSTORAGE_REQUEST` (as recorded by PR #7180) |
 
 ## Interface ids: strict
 
@@ -78,9 +81,32 @@ These parts are unchanged from the PR except where noted.
   - `CancelRequestsWithTag` marks requests that have not started. A cancelled request counts as a success with
     nothing read.
   - Failures are recorded in the status entry, the error record and the error event.
+- **zlib requests** (`ZlibDecompress` alone; adapted from upstream PR #7180, see below). Not yet requested by the
+  title in a local run, so this is prepared ahead of a measured DirectStorage zlib request, not a boot fix:
+  - Checks, after the reserved-bit, source-type and mode checks: `IntermediateSize` must be 0 (it only exists for
+    zlib + BCPack); `DestinationSize` must be larger than `SourceSize` (`_INVALID_DESTINATION_SIZE`); the unpaged
+    32 MiB destination limit and the 1 GiB request limit (`_REQUEST_TOO_LARGE`); a file `FileOffset` that is not
+    16-byte aligned (`_INVALID_FILE_OFFSET`); then the null-pointer and closed-file checks every request has.
+  - The worker copies `SourceSize` bytes of the file or memory into a staging buffer and inflates them into a second
+    one with the runtime's RFC 1950 inflater (`palmwave::zlib_inflate`, `runtime/src/shader_library.h`, the one the
+    shader library uses). The inflater never grows its output past `DestinationSize`. Only a stream whose header,
+    deflate data and Adler-32 verify and whose result is exactly `DestinationSize` bytes is copied to `Destination`.
+    A failed stream therefore leaves the destination exactly as it was (no zero fill), and a memory source inside its
+    own destination (in-place loading) is safe. Both staging buffers are at most 32 MiB; an allocation failure is
+    `E_OUTOFMEMORY`. Bytes after the Adler-32 are not read (an assumption: the reference does not say).
+  - Failures: a bad header (not deflate, a window over 32 KiB, a bad check value, a preset dictionary)
+    `E_DSTORAGE_ZLIB_BAD_HEADER`; bad or truncated deflate data or a missing Adler-32 `_ZLIB_BAD_DATA`; an Adler-32
+    mismatch `_ZLIB_PARITY_FAIL`; more or fewer bytes than `DestinationSize` `E_DSTORAGE_DECOMPRESSION_ERROR` (no
+    code names a size mismatch). An unreadable source or unwritable destination stays `E_DSTORAGE_ACCESS_VIOLATION`
+    and a short file `E_DSTORAGE_END_OF_FILE`. They go through the same status entry, error record and error event.
+  - A cancelled zlib request is treated like any cancelled request: it completes as a success, reads and writes
+    nothing and is not counted as a failure or a decompression.
+  - `GetStats`: `TotalDecompressionRequestCount` counts the requests that reached the inflate (checks passed, source
+    read), `PendingDecompressionRequestCount` the inflates running, `DecompressionErrors` the streams that failed.
+  - The inflater decodes one bit at a time on the queue's worker: correct, not fast.
 - **Unsupported requests fail honestly:**
-  - zlib, BCPack (modes 1-7) and swizzle (modes 1-4) return `E_NOTIMPL`.
-  - Physical source or destination pages return `E_NOTIMPL`.
+  - BCPack (modes 1-7) and swizzle (modes 1-4), alone or with zlib, return `E_NOTIMPL`.
+  - Physical source or destination pages, alone or with zlib, return `E_NOTIMPL`.
   - An unpaged buffer over 32 MiB returns `E_DSTORAGE_REQUEST_TOO_LARGE`.
   - Each of these checks runs before the destination is touched, so such a request never completes as a success
     with empty or stale data.
@@ -102,7 +128,18 @@ Nothing here goes online, sends telemetry or touches the GPU. Logging goes to st
     independent file positions, and caller-owned handles surviving explicit `Close` and final `Release`.
   - Strict-id rejection: each id is asked twice, every refused output is cleared, and a refused id creates no queue
     and opens no file.
-  - Unsupported requests leave a sentinel destination unchanged and are recorded as failures.
+  - Unsupported requests leave a sentinel destination unchanged and are recorded as failures, including zlib with
+    BCPack, swizzle or physical source/destination pages, which also never reach the inflate.
+- **zlib (`test_zlib`, adapted from PR #7180 and extended):** synthetic streams only: a dynamic-Huffman and a
+  fixed-Huffman stream made with Python's `zlib` from text the test rebuilds, and stored-block streams the test
+  builds (one stored block followed by the dynamic blocks). File and memory sources, in place with the source at
+  the end and at the start of its destination, padding after the trailer; each header, data, Adler-32 and size
+  failure, an empty source, a bad stored length, an unaligned offset, `IntermediateSize`, a source past the end of
+  the file, an unreadable source, an unwritable, null or over-32 MiB destination. Buffered destinations have canaries
+  past `DestinationSize`; malformed-stream and request-validation failures must leave the buffer unchanged. The error records, error events and
+  decompression statistics are checked, as are two cancelled zlib requests (success, nothing written, no inflate)
+  and a fence that must see the inflated bytes in place. `shader_library_test` checks the inflater's failure reasons
+  and that its output never passes the limit.
 
 `unimplemented_policy_test` checks that `xcrdapi.dll` / `XCRDAPI.dll!DStorageGetFactory` is classified as returning
 an HRESULT, and that other `xcrdapi.dll` names are not.
@@ -110,8 +147,10 @@ an HRESULT, and that other `xcrdapi.dll` names are not.
 ## Not done
 
 - The queue and status interface ids and local verification of sourced method ordinals, as described above.
-- zlib/DEFLATE, then BCPack (`tools/bcpack.py` is the reference decoder), then swizzle, as stages between the read
-  and the destination write.
+- A measured title zlib request: the zlib path has synthetic tests only, and which faults the console reports with
+  each `E_DSTORAGE_ZLIB_*` code is inferred.
+- BCPack (`tools/bcpack.py` is the reference decoder), then swizzle, as stages after the inflate and before the
+  destination write.
 - Physical pages (this needs `xmem` page-number translation).
 - Routing writes into Vulkan-backed GPU memory.
 - Parallel reads.
@@ -121,6 +160,9 @@ an HRESULT, and that other `xcrdapi.dll` names are not.
 | Source | Use |
 |---|---|
 | [upstream PR #4348](https://github.com/ItsNotRexed/Leonida/pull/4348), mariuslozo-boop, commit `45c39cf6f4148aebbc8a88d476bea755887d35bd`, GPL-3.0 | Code adapted (`dstorage.cpp`, `dstorage_xs_abi.h`, `dstorage_test.cpp`) |
+| [upstream PR #7180](https://github.com/ItsNotRexed/Leonida/pull/7180), KkelebekK, commit `00551ba0099699f35893ecd58a9ec34a2b54e95c`, GPL-3.0 (open, unmerged) | zlib request path, `ZlibError` reasons in `shader_library.h`, the four decompression error constants and the zlib tests, adapted onto the strict-id shim |
+| [`direct-storage` crate](https://docs.rs/direct-storage/0.5.1/src/direct_storage/bindings.rs.html) 0.5.1, MIT/Apache-2.0 | The names and values of `E_DSTORAGE_ZLIB_*` only (as recorded by PR #7180); no code |
+| [RFC 1950](https://www.rfc-editor.org/rfc/rfc1950), [RFC 1951](https://www.rfc-editor.org/rfc/rfc1951) | The zlib and DEFLATE formats |
 | ThatRecompDev/five-star-recomp `ff2a5dd95094fdceb5efdca9fd3236b7fa97076e`, GPL-3.0-or-later | Factory slots corroborated by source review; its unobserved file method is distinguished from the Xbox API; no code copied |
 | californiaAlmonds/OpenScarlett `0cbc742aa607bb19e3a580bfb81442cfcd99e39c`, MIT | Interface ids and names; conflicting method assumptions are not adopted; no code copied |
 | GDK DStorage reference and overview on Microsoft Learn; PC `dstorage.h`/`dstorageerr.h` 1.3.0 | Names, signatures, structures, error values (as recorded by the PR); facts only |

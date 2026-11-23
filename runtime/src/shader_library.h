@@ -31,6 +31,11 @@ namespace palmwave {
 // ---------------------------------------------------------------------------------------------------------------
 // zlib inflate
 
+// Why zlib_inflate failed, for a caller that reports the reason (runtime/shims/dstorage.cpp turns each into its
+// E_DSTORAGE_* code). `limit`: the output would pass the caller's limit; the stream was not read to its end.
+// The reason enum and its plumbing are adapted from upstream PR #7180 (KkelebekK, commit 00551ba0, GPL-3.0).
+enum class ZlibError { none, header, data, checksum, limit };
+
 namespace detail {
 
 class BitReader {
@@ -112,8 +117,8 @@ inline int decode(BitReader& in, const Huffman& h) {
     return -1;
 }
 
-inline bool inflate_codes(BitReader& in, std::vector<std::uint8_t>& out, const Huffman& lengths,
-                          const Huffman& distances, std::size_t limit) {
+inline ZlibError inflate_codes(BitReader& in, std::vector<std::uint8_t>& out, const Huffman& lengths,
+                               const Huffman& distances, std::size_t limit) {
     static constexpr std::int16_t length_base[29] = {3,  4,  5,  6,  7,  8,  9,  10, 11,  13,  15,  17,  19,  23, 27,
                                                      31, 35, 43, 51, 59, 67, 83, 99, 115, 131, 163, 195, 227, 258};
     static constexpr std::int16_t length_extra[29] = {0, 0, 0, 0, 0, 0, 0, 0, 1, 1, 1, 1, 2, 2, 2,
@@ -125,20 +130,21 @@ inline bool inflate_codes(BitReader& in, std::vector<std::uint8_t>& out, const H
                                                         6, 7, 7, 8, 8, 9, 9, 10, 10, 11, 11, 12, 12, 13, 13};
     for (;;) {
         int symbol = decode(in, lengths);
-        if (symbol < 0 || in.failed()) return false;
+        if (symbol < 0 || in.failed()) return ZlibError::data;
         if (symbol < 256) {
-            if (out.size() >= limit) return false;
+            if (out.size() >= limit) return ZlibError::limit;
             out.push_back(std::uint8_t(symbol));
             continue;
         }
-        if (symbol == 256) return true;
+        if (symbol == 256) return ZlibError::none;
         symbol -= 257;
-        if (symbol >= 29) return false;
+        if (symbol >= 29) return ZlibError::data;
         const std::size_t length = std::size_t(length_base[symbol]) + in.bits(length_extra[symbol]);
         const int d = decode(in, distances);
-        if (d < 0 || d >= 30) return false;
+        if (d < 0 || d >= 30) return ZlibError::data;
         const std::size_t distance = std::size_t(distance_base[d]) + in.bits(distance_extra[d]);
-        if (in.failed() || distance > out.size() || out.size() + length > limit) return false;
+        if (in.failed() || distance > out.size()) return ZlibError::data;
+        if (out.size() + length > limit) return ZlibError::limit;
         const std::size_t from = out.size() - distance;
         for (std::size_t i = 0; i < length; ++i) out.push_back(out[from + i]);
     }
@@ -147,28 +153,39 @@ inline bool inflate_codes(BitReader& in, std::vector<std::uint8_t>& out, const H
 } // namespace detail
 
 // Inflates a zlib stream (RFC 1950: header, deflate data, Adler-32). Returns false for a malformed stream, a
-// preset dictionary, a checksum mismatch, or output beyond `limit` bytes.
+// preset dictionary, a checksum mismatch, or output beyond `limit` bytes, and then stores the reason in `*why` when
+// it is given: `header` for the two header bytes (not deflate, a window over 32 KiB, a bad check value, a preset
+// dictionary), `data` for the deflate data or a missing trailer, `checksum` for an Adler-32 mismatch, `limit` for
+// output beyond `limit`. Bytes after the Adler-32 trailer are not read. `out` never grows past `limit` bytes.
 inline bool zlib_inflate(std::span<const std::uint8_t> in, std::vector<std::uint8_t>& out,
-                         std::size_t limit = std::size_t(1) << 30) {
+                         std::size_t limit = std::size_t(1) << 30, ZlibError* why = nullptr) {
     out.clear();
-    if (in.size() < 6) return false;
+    const auto fail = [why](ZlibError reason) {
+        if (why) *why = reason;
+        return false;
+    };
+    if (why) *why = ZlibError::none;
+    if (in.size() < 2) return fail(ZlibError::header);
     const unsigned cmf = in[0], flg = in[1];
-    if ((cmf & 0x0f) != 8 || (cmf >> 4) > 7 || ((cmf << 8) | flg) % 31 != 0 || (flg & 0x20)) return false;
+    if ((cmf & 0x0f) != 8 || (cmf >> 4) > 7 || ((cmf << 8) | flg) % 31 != 0 || (flg & 0x20))
+        return fail(ZlibError::header);
+    if (in.size() < 6) return fail(ZlibError::data);
     detail::BitReader reader(in.subspan(2));
     for (bool last = false; !last;) {
         last = reader.bits(1) != 0;
         const std::uint32_t type = reader.bits(2);
-        if (reader.failed()) return false;
+        if (reader.failed()) return fail(ZlibError::data);
         if (type == 0) {  // stored
             reader.align();
             std::uint8_t b[4];
             for (auto& x : b)
-                if (!reader.byte(x)) return false;
+                if (!reader.byte(x)) return fail(ZlibError::data);
             const unsigned length = b[0] | (b[1] << 8), complement = b[2] | (b[3] << 8);
-            if (length != (~complement & 0xffff) || out.size() + length > limit) return false;
+            if (length != (~complement & 0xffff)) return fail(ZlibError::data);
+            if (out.size() + length > limit) return fail(ZlibError::limit);
             for (unsigned i = 0; i < length; ++i) {
                 std::uint8_t x;
-                if (!reader.byte(x)) return false;
+                if (!reader.byte(x)) return fail(ZlibError::data);
                 out.push_back(x);
             }
         } else if (type == 1) {  // fixed Huffman
@@ -184,19 +201,21 @@ inline bool zlib_inflate(std::span<const std::uint8_t> in, std::vector<std::uint
                 detail::build_huffman(t.second, lengths, 30);
                 return t;
             }();
-            if (!detail::inflate_codes(reader, out, tables.first, tables.second, limit)) return false;
+            if (const ZlibError e = detail::inflate_codes(reader, out, tables.first, tables.second, limit);
+                e != ZlibError::none)
+                return fail(e);
         } else if (type == 2) {  // dynamic Huffman
             const int literal_count = int(reader.bits(5)) + 257, distance_count = int(reader.bits(5)) + 1;
             const int code_count = int(reader.bits(4)) + 4;
-            if (literal_count > 286 || distance_count > 30) return false;
+            if (literal_count > 286 || distance_count > 30) return fail(ZlibError::data);
             static constexpr int order[19] = {16, 17, 18, 0, 8, 7, 9, 6, 10, 5, 11, 4, 12, 3, 13, 2, 14, 1, 15};
             std::int16_t lengths[320] = {};
             for (int i = 0; i < code_count; ++i) lengths[order[i]] = std::int16_t(reader.bits(3));
             detail::Huffman code_lengths;
-            if (!detail::build_huffman(code_lengths, lengths, 19)) return false;
+            if (!detail::build_huffman(code_lengths, lengths, 19)) return fail(ZlibError::data);
             for (int i = 0; i < literal_count + distance_count;) {
                 const int symbol = detail::decode(reader, code_lengths);
-                if (symbol < 0) return false;
+                if (symbol < 0) return fail(ZlibError::data);
                 if (symbol < 16) {
                     lengths[i++] = std::int16_t(symbol);
                     continue;
@@ -204,7 +223,7 @@ inline bool zlib_inflate(std::span<const std::uint8_t> in, std::vector<std::uint
                 std::int16_t value = 0;
                 int repeat;
                 if (symbol == 16) {
-                    if (i == 0) return false;
+                    if (i == 0) return fail(ZlibError::data);
                     value = lengths[i - 1];
                     repeat = 3 + int(reader.bits(2));
                 } else if (symbol == 17) {
@@ -212,23 +231,24 @@ inline bool zlib_inflate(std::span<const std::uint8_t> in, std::vector<std::uint
                 } else {
                     repeat = 11 + int(reader.bits(7));
                 }
-                if (i + repeat > literal_count + distance_count) return false;
+                if (i + repeat > literal_count + distance_count) return fail(ZlibError::data);
                 while (repeat--) lengths[i++] = value;
             }
-            if (lengths[256] == 0) return false;  // no end-of-block code
+            if (lengths[256] == 0) return fail(ZlibError::data);  // no end-of-block code
             detail::Huffman literal, distance;
             if (!detail::build_huffman(literal, lengths, literal_count) ||
                 !detail::build_huffman(distance, lengths + literal_count, distance_count))
-                return false;
-            if (!detail::inflate_codes(reader, out, literal, distance, limit)) return false;
+                return fail(ZlibError::data);
+            if (const ZlibError e = detail::inflate_codes(reader, out, literal, distance, limit); e != ZlibError::none)
+                return fail(e);
         } else {
-            return false;
+            return fail(ZlibError::data);
         }
-        if (reader.failed()) return false;
+        if (reader.failed()) return fail(ZlibError::data);
     }
     // Adler-32, big-endian, after the deflate data's last whole byte.
     const std::size_t at = 2 + reader.position();
-    if (at + 4 > in.size()) return false;
+    if (at + 4 > in.size()) return fail(ZlibError::data);
     std::uint32_t a = 1, b = 0;
     for (const std::uint8_t x : out) {
         a = (a + x) % 65521;
@@ -236,7 +256,7 @@ inline bool zlib_inflate(std::span<const std::uint8_t> in, std::vector<std::uint
     }
     const std::uint32_t expected = (std::uint32_t(in[at]) << 24) | (std::uint32_t(in[at + 1]) << 16) |
                                    (std::uint32_t(in[at + 2]) << 8) | in[at + 3];
-    return ((b << 16) | a) == expected;
+    return ((b << 16) | a) == expected || fail(ZlibError::checksum);
 }
 
 // ---------------------------------------------------------------------------------------------------------------

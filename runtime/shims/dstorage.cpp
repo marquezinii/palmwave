@@ -5,7 +5,8 @@
 // GPL-3.0); see UPSTREAM.md. The queue, file, status-array, request and error-record code is the PR's. Palmwave
 // changes: the interface-id policy is strict (known ids only, nothing learned at run time, no PC id for a console
 // object), and OpenFile refuses to open anything when the runtime's file-system shim is not registered instead of
-// falling back to the host's CreateFileW.
+// falling back to the host's CreateFileW. zlib requests (inflate_request) are adapted from upstream PR #7180 by
+// KkelebekK (commit 00551ba0099699f35893ecd58a9ec34a2b54e95c, GPL-3.0), on top of the Palmwave changes above.
 //
 // Served as xcrdapi.dll (the module the retail executable imports it from), dstorage_xs.dll and dstorage.dll
 // DStorageGetFactory; docs/directstorage.md has the evidence and what each method does. In short:
@@ -14,7 +15,12 @@
 //   - Each queue has one worker thread that runs its submitted entries in order: a request reads a file range or
 //     copies a memory range into the destination, a status entry, fence signal or event runs when every entry before
 //     it has. Completion is therefore in queue order, as the API guarantees.
-//   - zlib, BCPack, swizzle and physical-page requests fail with E_NOTIMPL and write nothing to the destination.
+//   - A zlib request (ZlibDecompress alone) reads its source into a staging buffer, inflates it on the worker with
+//     the runtime's RFC 1950 inflater (palmwave::zlib_inflate, src/shader_library.h) and copies the result to the
+//     destination only when the stream verified and is exactly DestinationSize bytes; a stream that fails leaves the
+//     destination as it was.
+//   - BCPack and swizzle (with or without zlib) and physical-page requests fail with E_NOTIMPL and write nothing to
+//     the destination.
 // Nothing here goes online, reports anywhere, or touches the GPU.
 #include <windows.h>
 #include <d3d12.h>
@@ -34,6 +40,7 @@
 #include <unordered_set>
 #include <vector>
 
+#include "../src/shader_library.h"  // palmwave::zlib_inflate
 #include "dstorage_xs_abi.h"
 #include "shims.h"
 
@@ -711,22 +718,33 @@ private:
         if (options::source_type(o) != desc_.SourceType) return E_DSTORAGE_INVALID_SOURCE_TYPE;
         if (options::bcpack(o) > DSTORAGE_BCPACK_MODE_BC7) return E_DSTORAGE_INVALID_BCPACK_MODE;
         if (options::swizzle(o) > DSTORAGE_SWIZZLE_MODE_4K_12K_4K_12K) return E_DSTORAGE_INVALID_SWIZZLE_MODE;
-        if (options::zlib(o) || options::bcpack(o) != 0 || options::swizzle(o) != 0) {
-            log_once("decompress", "zlib, BCPack and swizzle requests are not implemented (E_NOTIMPL)");
+        // BCPack and swizzle, alone or combined with zlib, are not implemented: refused before anything is read.
+        if (options::bcpack(o) != 0 || options::swizzle(o) != 0) {
+            log_once("decompress",
+                     "BCPack and swizzle requests (with or without zlib) are not implemented (E_NOTIMPL)");
             return E_NOTIMPL;
         }
         if (o & (options::kDestinationPages | options::kSourcePages)) {
             log_once("pages", "physical-page requests are not implemented (E_NOTIMPL)");
             return E_NOTIMPL;
         }
-        if (r.IntermediateSize != 0) return E_DSTORAGE_INVALID_INTERMEDIATE_SIZE;  // only zlib + BCPack use it
-        if (r.DestinationSize != r.SourceSize) return E_DSTORAGE_INVALID_DESTINATION_SIZE;
+        const bool zlib = options::zlib(o);
+        // IntermediateSize is the BCPack data's size between the inflate and the BCPack decode (DSTORAGE_REQUEST), so
+        // it is 0 for every request that gets here (BCPack is refused above).
+        if (r.IntermediateSize != 0) return E_DSTORAGE_INVALID_INTERMEDIATE_SIZE;
+        // E_DSTORAGE_INVALID_DESTINATION_SIZE: without decompression DestinationSize must equal the source's length,
+        // with it it must be larger (dstorageerr.h's description; DSTORAGE_REQUEST says the same of DestinationSize).
+        if (zlib ? r.DestinationSize <= r.SourceSize : r.DestinationSize != r.SourceSize)
+            return E_DSTORAGE_INVALID_DESTINATION_SIZE;
         const bool memory = desc_.SourceType == DSTORAGE_REQUEST_SOURCE_MEMORY;
         const uint64_t total = static_cast<uint64_t>(r.DestinationSize) + (memory ? r.SourceSize : 0u);
         if (total > kMaxRequestBytes) return E_DSTORAGE_REQUEST_TOO_LARGE;
-        // DSTORAGE_REQUEST: a destination over 32 MiB is allowed only with 64 KiB or 2 MiB pages, which are not
-        // implemented (refused above). The source equals the destination here, so this covers both buffers.
+        // DSTORAGE_REQUEST: a buffer over 32 MiB is allowed only with 64 KiB or 2 MiB pages, which are not
+        // implemented (refused above). The source is never larger than the destination here (the same size without
+        // zlib, smaller with it), so this covers both buffers and bounds a zlib request's two staging buffers.
         if (r.DestinationSize > kMax4kPageDestinationSize) return E_DSTORAGE_REQUEST_TOO_LARGE;
+        // DSTORAGE_REQUEST: with ZlibDecompress the file offset must be 16-byte aligned.
+        if (zlib && !memory && r.FileOffset % 16 != 0) return E_DSTORAGE_INVALID_FILE_OFFSET;
         if (!r.Destination) return E_INVALIDARG;
         if (memory) {
             if (!r.Source) return E_INVALIDARG;
@@ -734,14 +752,78 @@ private:
             if (!r.File) return E_INVALIDARG;
             if (!e.file_counted) return E_DSTORAGE_FILE_NOT_OPEN;
         }
+        if (zlib) return inflate_request(e, memory);
         if (r.SourceSize == 0) return S_OK;  // nothing to move; the reference does not say this fails
         if (memory) return guarded_move(r.Destination, r.Source, r.SourceSize) ? S_OK : E_DSTORAGE_ACCESS_VIOLATION;
         return read_file_range(e.file->handle(), r.FileOffset, r.Destination, r.SourceSize);
     }
 
+    // A zlib request whose checks have passed (execute_request). The source, SourceSize bytes of the file or of
+    // memory, is copied into a staging buffer and inflated there into a second one; only a stream that verified
+    // (header, deflate data, Adler-32) and inflated to exactly DestinationSize bytes is copied to the destination. So a
+    // failed stream leaves the destination as it was, and a memory source that overlaps its destination (in-place
+    // loading) is safe. Both staging buffers are at most 32 MiB (execute_request), and the inflater never grows its
+    // output past DestinationSize. Bytes after the Adler-32 are not read. A failure is the matching dstorageerr.h code:
+    //   - E_DSTORAGE_ZLIB_BAD_HEADER: not deflate, a window over 32 KiB, a bad check value or a preset dictionary;
+    //   - E_DSTORAGE_ZLIB_BAD_DATA: bad or truncated deflate data, or a missing Adler-32;
+    //   - E_DSTORAGE_ZLIB_PARITY_FAIL: an Adler-32 mismatch;
+    //   - E_DSTORAGE_DECOMPRESSION_ERROR: a stream that inflates to more or fewer bytes than DestinationSize (no code
+    //     names a size mismatch; this is the header's generic decompression failure).
+    // The three zlib codes' meanings are inferred from their names (dstorage_xs_abi.h), not documented.
+    HRESULT inflate_request(const Entry& e, bool memory) {
+        const DSTORAGE_REQUEST& r = e.request;
+        std::vector<uint8_t> source, result;
+        try {
+            source.resize(r.SourceSize);
+            result.reserve(r.DestinationSize);
+        } catch (const std::bad_alloc&) {
+            return E_OUTOFMEMORY;
+        }
+        if (r.SourceSize != 0) {
+            if (memory) {
+                if (!guarded_move(source.data(), r.Source, r.SourceSize)) return E_DSTORAGE_ACCESS_VIOLATION;
+            } else if (const HRESULT hr = read_file_range(e.file->handle(), r.FileOffset, source.data(), r.SourceSize);
+                       FAILED(hr)) {
+                return hr;
+            }
+        }
+        log_once("zlib", "zlib requests are inflated on the queue's CPU worker (RFC 1950, palmwave::zlib_inflate)");
+        set_decompression_pending(+1);
+        palmwave::ZlibError why = palmwave::ZlibError::none;
+        const bool inflated = palmwave::zlib_inflate(source, result, r.DestinationSize, &why);
+        set_decompression_pending(-1);
+        HRESULT hr = S_OK;
+        if (!inflated) {
+            switch (why) {
+                case palmwave::ZlibError::header: hr = E_DSTORAGE_ZLIB_BAD_HEADER; break;
+                case palmwave::ZlibError::checksum: hr = E_DSTORAGE_ZLIB_PARITY_FAIL; break;
+                case palmwave::ZlibError::limit: hr = E_DSTORAGE_DECOMPRESSION_ERROR; break;  // longer than the destination
+                default: hr = E_DSTORAGE_ZLIB_BAD_DATA; break;
+            }
+        } else if (result.size() != r.DestinationSize) {
+            hr = E_DSTORAGE_DECOMPRESSION_ERROR;  // shorter than the destination
+        }
+        if (FAILED(hr)) {
+            std::lock_guard lock(stats().mutex);
+            ++stats().s.DecompressionErrors;
+            return hr;
+        }
+        return guarded_move(r.Destination, result.data(), result.size()) ? S_OK : E_DSTORAGE_ACCESS_VIOLATION;
+    }
+
     void set_pending(int delta) {
         std::lock_guard lock(stats().mutex);
         priority_stats(stats().s, desc_.Priority).PendingRequestCount += static_cast<uint32_t>(delta);
+    }
+
+    // PendingDecompressionRequestCount is the zlib requests being inflated; TotalDecompressionRequestCount counts each
+    // one that reached its inflate (its checks passed and its source was read), DecompressionErrors those whose stream
+    // then failed. A cancelled request never reaches the inflate and is counted in none of them.
+    static void set_decompression_pending(int delta) {
+        std::lock_guard lock(stats().mutex);
+        auto& s = stats().s;
+        s.PendingDecompressionRequestCount += static_cast<uint32_t>(delta);
+        if (delta > 0) ++s.TotalDecompressionRequestCount;
     }
 
     void describe(const Entry& e, DSTORAGE_ERROR_FIRST_FAILURE& f) const {

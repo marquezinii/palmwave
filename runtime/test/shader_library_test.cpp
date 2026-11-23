@@ -292,6 +292,46 @@ int main() {
     CHECK(!zlib_inflate(broken, out));
     CHECK(!zlib_inflate(dynamic, out, 599));  // larger than the limit
     CHECK(!zlib_inflate(bytes("not zlib"), out));
+    // The reason a caller can ask for (dstorage.cpp reports each with its own HRESULT). The first five checks are
+    // adapted from upstream PR #7180 (KkelebekK, 00551ba0, GPL-3.0); the rest are Palmwave additions.
+    ZlibError why = ZlibError::limit;
+    CHECK(zlib_inflate(dynamic, out, 600, &why) && why == ZlibError::none);
+    CHECK(!zlib_inflate(dynamic, out, 599, &why) && why == ZlibError::limit);
+    CHECK(!zlib_inflate(bytes("not zlib"), out, 1 << 20, &why) && why == ZlibError::header);
+    broken = dynamic;
+    broken.back() ^= 1;
+    CHECK(!zlib_inflate(broken, out, 1 << 20, &why) && why == ZlibError::checksum);
+    broken.resize(100);
+    CHECK(!zlib_inflate(broken, out, 1 << 20, &why) && why == ZlibError::data);
+    // A limit is a hard bound on the output buffer, for every block type.
+    CHECK(!zlib_inflate(dynamic, out, 599, &why) && why == ZlibError::limit && out.size() <= 599);
+    CHECK(!zlib_inflate(stored, out, 39, &why) && why == ZlibError::limit && out.size() <= 39);
+    CHECK(!zlib_inflate(fixed, out, 24, &why) && why == ZlibError::limit && out.size() <= 24);
+    CHECK(zlib_inflate(stored, out, 40, &why) && why == ZlibError::none && out.size() == 40);
+    // Header: one byte, a preset dictionary (78 BB has a valid check value and FDICT), a 64 KiB window (CINFO 8).
+    CHECK(!zlib_inflate(std::vector<std::uint8_t>{0x78}, out, 1 << 20, &why) && why == ZlibError::header);
+    broken = dynamic;
+    broken[1] = 0xbb;
+    CHECK(!zlib_inflate(broken, out, 1 << 20, &why) && why == ZlibError::header);
+    broken = dynamic;
+    broken[0] = 0x88;
+    broken[1] = 0x1c;  // 0x881c is a multiple of 31: only the window size is wrong
+    CHECK(!zlib_inflate(broken, out, 1 << 20, &why) && why == ZlibError::header);
+    // Data: a valid header and nothing else, a stored block whose length complement is wrong, a reserved block type.
+    CHECK(!zlib_inflate(std::vector<std::uint8_t>{0x78, 0x01}, out, 1 << 20, &why) && why == ZlibError::data);
+    broken = stored;
+    broken[5] ^= 1;
+    CHECK(!zlib_inflate(broken, out, 1 << 20, &why) && why == ZlibError::data);
+    broken = fixed;
+    broken[2] |= 0x06;  // BTYPE 3
+    CHECK(!zlib_inflate(broken, out, 1 << 20, &why) && why == ZlibError::data);
+    // A stream whose Adler-32 trailer is cut off is data, not checksum; bytes after the trailer are not read.
+    broken = stored;
+    broken.pop_back();
+    CHECK(!zlib_inflate(broken, out, 1 << 20, &why) && why == ZlibError::data);
+    broken = stored;
+    broken.insert(broken.end(), {0xde, 0xad, 0xbe, 0xef});
+    CHECK(zlib_inflate(broken, out, 1 << 20, &why) && why == ZlibError::none && out.size() == 40);
 
     Json json;
     // "s" holds an escaped quote and a \u escape for U+00E9, which the reader must turn into UTF-8.

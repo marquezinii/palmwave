@@ -220,8 +220,11 @@ Current limits, by design:
   upstream PR #4348). Only the measured factory/file ids and `IUnknown` are accepted for their respective objects.
   The Xbox file interface returns a caller-owned handle through `GetHandle`. Files open through the
   `GAME:` mapping and the overlay; each queue reads file or memory ranges on its own CPU worker thread and reports
-  through status arrays, `ID3D12Fence` signals and events. zlib, BCPack, swizzle and physical-page requests fail
-  with `E_NOTIMPL`. See [docs/directstorage.md](../docs/directstorage.md).
+  through status arrays, `ID3D12Fence` signals and events. A zlib request (ZlibDecompress alone, file or memory
+  source) is inflated on that worker by `src/shader_library.h`'s RFC 1950 inflater into a staging buffer and copied
+  to the destination only when it verifies at exactly `DestinationSize` bytes (adapted from upstream PR #7180; not
+  yet exercised by the title). BCPack, swizzle (with or without zlib) and physical-page requests fail with
+  `E_NOTIMPL`. See [docs/directstorage.md](../docs/directstorage.md).
 
 - `gameinput.dll` / `xgameruntime.dll` — `GameInputCreate`: the v0 GameInput API for gamepads on SDL3
   (`shims/gameinput.cpp`), so any controller SDL supports works, with rumble, Xbox trigger rumble, force feedback
