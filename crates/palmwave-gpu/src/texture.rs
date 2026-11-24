@@ -838,8 +838,7 @@ pub(crate) fn committed(at: *const u8, len: usize) -> bool {
     if len == 0 {
         return true;
     }
-    let (there, of) = readable(at as usize, len, true);
-    there == of
+    readable(at as usize, len, KERNEL_PAGE, true).1 == len
 }
 
 /// Whether the two questions above and below are put to `VirtualQuery`, as
@@ -856,28 +855,31 @@ fn by_query() -> bool {
     *ON.get_or_init(|| std::env::var_os("PALMWAVE_COMMITTED_QUERY").is_some_and(|v| v == "1"))
 }
 
-/// Of the kernel's pages that hold `[at, at + len)` (`len > 0`): how many
-/// can be read, and how many there are; with `all`, it stops at the first
-/// that cannot. One question to the kernel for up to 256 pages at once
+const KERNEL_PAGE: usize = 4096;
+
+/// Samples one kernel page per block of `[at, at + len)` (`len > 0`).
+/// Returns the number of readable samples and the bytes their blocks
+/// cover inside the range. With `all`, stops at the first unreadable page.
+/// One question to the kernel for up to 256 samples at once
 /// (`QueryWorkingSetEx`: the state of each page asked about, no walk); a
 /// page not in the working set may still be there (never touched, or
 /// trimmed), and a one-byte read through the kernel says.
 /// A page that is committed and may not be read counts as not there, which
 /// is what the callers ask for: they read or write the memory next.
-fn readable(at: usize, len: usize, all: bool) -> (usize, usize) {
+fn readable(at: usize, len: usize, block: usize, all: bool) -> (usize, usize) {
     use windows_sys::Win32::System::ProcessStatus::{K32QueryWorkingSetEx, PSAPI_WORKING_SET_EX_INFORMATION};
     use windows_sys::Win32::System::Threading::GetCurrentProcess;
-    const KERNEL_PAGE: usize = 4096;
-    let (first, last) = (at / KERNEL_PAGE, at.saturating_add(len - 1) / KERNEL_PAGE);
-    let of = last - first + 1;
-    let mut there = 0;
-    // SAFETY: plain data.
-    let mut info: [PSAPI_WORKING_SET_EX_INFORMATION; 256] = unsafe { std::mem::zeroed() };
-    let mut page = first;
-    while page <= last {
-        let n = (last - page + 1).min(info.len());
+    let end = at.saturating_add(len);
+    let last = (end - 1) / block;
+    let (mut count, mut bytes) = (0, 0);
+    let mut info = [PSAPI_WORKING_SET_EX_INFORMATION::default(); 256];
+    let mut first = at / block;
+    while first <= last {
+        let n = (last - first + 1).min(info.len());
         for (i, entry) in info[..n].iter_mut().enumerate() {
-            entry.VirtualAddress = ((page + i) * KERNEL_PAGE) as *mut _;
+            // A texture may start several kernel pages into its first block.
+            let sample = ((first + i) * block).max(at) & !(KERNEL_PAGE - 1);
+            entry.VirtualAddress = sample as *mut _;
         }
         // SAFETY: `n` entries of the size given; our own process.
         let asked = unsafe {
@@ -892,15 +894,17 @@ fn readable(at: usize, len: usize, all: bool) -> (usize, usize) {
             // SAFETY: plain data the query filled in.
             let valid = asked && unsafe { entry.VirtualAttributes.Flags } & 1 != 0;
             let mut byte = [0u8];
-            if valid || crate::host::read_into(((page + i) * KERNEL_PAGE) as *const u8, &mut byte) {
-                there += 1;
+            if valid || crate::host::read_into(entry.VirtualAddress.cast(), &mut byte) {
+                let base = (first + i) * block;
+                bytes += base.saturating_add(block).min(end) - base.max(at);
+                count += 1;
             } else if all {
-                return (there, of);
+                return (count, bytes);
             }
         }
-        page += n;
+        first += n;
     }
-    (there, of)
+    (count, bytes)
 }
 
 fn committed_by_query(at: *const u8, len: usize) -> bool {
@@ -940,8 +944,8 @@ pub(crate) fn mapped_bytes(at: *const u8, len: usize) -> u64 {
         static BY_PAGE: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
         if *BY_PAGE.get_or_init(|| std::env::var_os("PALMWAVE_MAPPED_BY_PAGE").is_some_and(|v| v == "1")) {
             // By page, without the walk: whole pages, cut to the range.
-            let (there, _) = readable(start, len, false);
-            return (there as u64 * 4096).min(len as u64);
+            let (there, _) = readable(start, len, KERNEL_PAGE, false);
+            return (there as u64 * KERNEL_PAGE as u64).min(len as u64);
         }
         // By 64 KiB block, one page asked of each: the title's memory is
         // mapped in blocks of that size (the console's page), and the
@@ -952,16 +956,7 @@ pub(crate) fn mapped_bytes(at: *const u8, len: usize) -> u64 {
         // textures "uploaded in part" kept the pass over the heap's views at
         // 90-160 ms a frame (run 81). `PALMWAVE_MAPPED_BY_PAGE=1`: by page.
         const BLOCK: usize = 64 << 10;
-        let mut there = 0u64;
-        let mut block = start & !(BLOCK - 1);
-        while block < end {
-            let (lo, hi) = (block.max(start), block.saturating_add(BLOCK).min(end));
-            if readable(lo, 1, true).0 == 1 {
-                there += (hi - lo) as u64;
-            }
-            block = block.saturating_add(BLOCK);
-        }
-        return there;
+        return readable(start, len, BLOCK, false).1 as u64;
     }
     let (mut p, mut there) = (start, 0u64);
     while p < end {
@@ -1058,6 +1053,38 @@ fn staging(resource: This, texture: &ID3D12Resource) -> Option<Arc<Staging>> {
 #[cfg(test)]
 mod title_memory_tests {
     use super::with_title;
+
+    #[test]
+    fn block_samples_count_unaligned_edges_across_query_batches() {
+        use windows_sys::Win32::System::Memory::*;
+        const BLOCK: usize = 64 << 10;
+        const SIZE: usize = 259 * BLOCK;
+        // SAFETY: only this test uses the reservation. We touch only
+        // committed pages and free the entire reservation after sampling.
+        unsafe {
+            let base = VirtualAlloc(std::ptr::null(), SIZE, MEM_RESERVE, PAGE_NOACCESS).cast::<u8>();
+            assert!(!base.is_null());
+            let offset = 3 * super::KERNEL_PAGE + 17;
+            let end = SIZE - 700;
+            let first = base.add(offset - 17);
+            assert_eq!(VirtualAlloc(first.cast(), super::KERNEL_PAGE, MEM_COMMIT, PAGE_READWRITE), first.cast());
+            first.write(1);
+            for index in [1, 255, 256, 258] {
+                let page = base.add(index * BLOCK);
+                assert_eq!(VirtualAlloc(page.cast(), super::KERNEL_PAGE, MEM_COMMIT, PAGE_READWRITE), page.cast());
+                // Leave some pages untouched to exercise the kernel-read fallback.
+                if index % 2 == 0 {
+                    page.write(1);
+                }
+            }
+            let start = base.add(offset) as usize;
+            assert_eq!(super::readable(start, end - offset, BLOCK, false), (5, 5 * BLOCK - offset - 700));
+            assert_eq!(super::readable(start, end - offset, BLOCK, true), (2, 2 * BLOCK - offset));
+            assert_eq!(super::readable(start, 13, BLOCK, false), (1, 13));
+            assert_eq!(super::readable(start, BLOCK, super::KERNEL_PAGE, true), (1, super::KERNEL_PAGE - 17));
+            assert_ne!(VirtualFree(base.cast(), 0, MEM_RELEASE), 0);
+        }
+    }
 
     /// Title memory whose tail is reserved and not committed reads through
     /// the copy as its bytes and then zeros, without a fault; so does
