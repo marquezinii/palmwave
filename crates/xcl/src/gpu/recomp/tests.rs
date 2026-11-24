@@ -6671,6 +6671,277 @@ fn bench_split_wave64() {
     }
 }
 
+/// Where the GPU reads title memory fastest (`cargo test --release -p xcl --lib -- --ignored
+/// bench_memory_placement --nocapture`). The title's GPU heaps are in the coherent window: host
+/// memory imported as a heap (`OpenExistingHeapFromAddress`), which the GPU reads across PCIe.
+/// The same 256 MiB are read here from that import, from a write-combined custom heap in host
+/// memory, from video memory (a default heap) and from video memory the CPU maps through the BAR
+/// (a GPU upload heap, where the driver offers it): chains of dependent loads (each load's address
+/// the value the one before read, as a program's descriptor loads before the loads that use them)
+/// in 64 KiB and in the whole buffer, by one group and by 1024, and a streaming read of the
+/// buffer, each through a plain view and through a `globallycoherent` one (the translated compute
+/// programs' UMA windows). GPU time of the dispatch (timestamps), median of 7. The chains' ends are checked
+/// against the CPU's, so each placement was really read.
+#[test]
+#[ignore]
+fn bench_memory_placement() {
+    use std::mem::{transmute_copy, ManuallyDrop};
+    use windows::core::Interface;
+    use windows::Win32::Graphics::Direct3D::D3D_FEATURE_LEVEL_12_0;
+    use windows::Win32::Graphics::Direct3D12::*;
+    use windows::Win32::Graphics::Dxgi::Common::DXGI_SAMPLE_DESC;
+    use windows::Win32::Graphics::Dxgi::*;
+    use windows_sys::Win32::System::Memory::{VirtualAlloc, VirtualFree, MEM_COMMIT, MEM_RELEASE, MEM_RESERVE, PAGE_READWRITE};
+
+    fn transition(r: &ID3D12Resource, before: D3D12_RESOURCE_STATES, after: D3D12_RESOURCE_STATES) -> D3D12_RESOURCE_BARRIER {
+        D3D12_RESOURCE_BARRIER {
+            Type: D3D12_RESOURCE_BARRIER_TYPE_TRANSITION,
+            Flags: D3D12_RESOURCE_BARRIER_FLAG_NONE,
+            Anonymous: D3D12_RESOURCE_BARRIER_0 {
+                Transition: ManuallyDrop::new(D3D12_RESOURCE_TRANSITION_BARRIER {
+                    pResource: unsafe { transmute_copy(r) },
+                    Subresource: D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES,
+                    StateBefore: before,
+                    StateAfter: after,
+                }),
+            },
+        }
+    }
+    fn uav_barrier(r: &ID3D12Resource) -> D3D12_RESOURCE_BARRIER {
+        D3D12_RESOURCE_BARRIER {
+            Type: D3D12_RESOURCE_BARRIER_TYPE_UAV,
+            Flags: D3D12_RESOURCE_BARRIER_FLAG_NONE,
+            Anonymous: D3D12_RESOURCE_BARRIER_0 { UAV: ManuallyDrop::new(D3D12_RESOURCE_UAV_BARRIER { pResource: unsafe { transmute_copy(r) } }) },
+        }
+    }
+
+    if !gpu_ready() {
+        return;
+    }
+    const BYTES: usize = 256 << 20;
+    const WORDS: usize = BYTES / 4;
+    const OUT: u64 = 1 << 20;
+    const REPS: usize = 7;
+    // word p holds the step after p of an LCG of full period modulo 2^26, so `p & mask` walks one
+    // cycle of every power-of-two table size up to the buffer's
+    let step = |p: u32| p.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+    // the table written by the CPU, twice: GB/s of the second time (the first touches the pages)
+    let fill = |w: *mut u32| {
+        let write = || (0..WORDS).for_each(|p| unsafe { std::ptr::write_volatile(w.add(p), step(p as u32) & (WORDS as u32 - 1)) });
+        write();
+        let t = std::time::Instant::now();
+        write();
+        BYTES as f64 / t.elapsed().as_secs_f64() / 1e9
+    };
+    const SRC: &str = r#"
+cbuffer C : register(b0) { uint mask; uint iters; uint words; uint pad; };
+COHERENT RWByteAddressBuffer mem : register(u0);
+RWByteAddressBuffer outb : register(u1);
+#define RS "RootConstants(num32BitConstants=4, b0), UAV(u0), UAV(u1)"
+[RootSignature(RS)] [numthreads(64, 1, 1)]
+void chase(uint3 g : SV_GroupID, uint t : SV_GroupIndex) {
+    uint p = (g.x * 4099u) & mask;
+    [loop] for (uint i = 0; i < iters; i++) p = mem.Load(p * 4) & mask;
+    if (t == 0) outb.Store(g.x * 4, p);
+}
+[RootSignature(RS)] [numthreads(256, 1, 1)]
+void stream(uint3 d : SV_DispatchThreadID) {
+    uint4 s = 0;
+    [loop] for (uint i = d.x * 4; i < words; i += 4 * 256 * 1024) s += mem.Load4(i * 4);
+    outb.Store(d.x * 4, s.x ^ s.y ^ s.z ^ s.w);
+}
+"#;
+    // each program twice: a plain view, and a `globallycoherent` one, as translated compute
+    // programs declare the UMA windows (`emit.rs`, `Mode::Compute`)
+    let views = ["", "globallycoherent "].map(|coherent| {
+        let src = SRC.replace("COHERENT ", coherent);
+        let compile = |entry| super::dxc::compile(&src, entry, "cs_6_6", &[]).unwrap_or_else(|e| panic!("{e}"));
+        (compile("chase"), compile("stream"))
+    });
+    unsafe {
+        let factory: IDXGIFactory6 = CreateDXGIFactory2(DXGI_CREATE_FACTORY_FLAGS(0)).unwrap();
+        let sel = crate::gpu::adapter::Selector::from_env_or("auto");
+        let (adapter, adesc) = crate::gpu::adapter::candidates(&factory, &sel).into_iter().next().expect("an adapter");
+        let dev = crate::gpu::agility::create_device(&adapter, D3D_FEATURE_LEVEL_12_0).unwrap();
+        let queue: ID3D12CommandQueue = dev.CreateCommandQueue(&D3D12_COMMAND_QUEUE_DESC { Type: D3D12_COMMAND_LIST_TYPE_DIRECT, ..Default::default() }).unwrap();
+        let rs: ID3D12RootSignature = dev.CreateRootSignature(0, &views[0].0).unwrap();
+        let pso = |dxil: &[u8]| -> ID3D12PipelineState {
+            dev.CreateComputePipelineState(&D3D12_COMPUTE_PIPELINE_STATE_DESC {
+                pRootSignature: transmute_copy(&rs),
+                CS: D3D12_SHADER_BYTECODE { pShaderBytecode: dxil.as_ptr() as _, BytecodeLength: dxil.len() },
+                ..Default::default()
+            })
+            .unwrap()
+        };
+        // (chase, stream) of the plain view, then of the coherent one
+        let psos = views.each_ref().map(|(chase, stream)| (pso(chase), pso(stream)));
+        let desc = |bytes: u64, flags: D3D12_RESOURCE_FLAGS| D3D12_RESOURCE_DESC {
+            Dimension: D3D12_RESOURCE_DIMENSION_BUFFER,
+            Width: bytes,
+            Height: 1,
+            DepthOrArraySize: 1,
+            MipLevels: 1,
+            SampleDesc: DXGI_SAMPLE_DESC { Count: 1, Quality: 0 },
+            Layout: D3D12_TEXTURE_LAYOUT_ROW_MAJOR,
+            Flags: flags,
+            ..Default::default()
+        };
+        let committed = |props: D3D12_HEAP_PROPERTIES, bytes: u64, flags: D3D12_RESOURCE_FLAGS, state: D3D12_RESOURCE_STATES| -> windows::core::Result<ID3D12Resource> {
+            let mut r: Option<ID3D12Resource> = None;
+            dev.CreateCommittedResource(&props, D3D12_HEAP_FLAG_NONE, &desc(bytes, flags), state, None, &mut r)?;
+            Ok(r.unwrap())
+        };
+        let heap_type = |t: D3D12_HEAP_TYPE| D3D12_HEAP_PROPERTIES { Type: t, ..Default::default() };
+        let mapped_fill = |r: &ID3D12Resource| {
+            let mut p = std::ptr::null_mut();
+            r.Map(0, None, Some(&mut p)).unwrap();
+            let gbs = fill(p as *mut u32);
+            r.Unmap(0, None);
+            gbs
+        };
+        let uav = D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS;
+        // the video memory the process uses (MiB): where the driver put a placement
+        let adapter3: IDXGIAdapter3 = adapter.cast().unwrap();
+        let vram_mib = || {
+            let mut i = DXGI_QUERY_VIDEO_MEMORY_INFO::default();
+            adapter3.QueryVideoMemoryInfo(0, DXGI_MEMORY_SEGMENT_GROUP_LOCAL, &mut i).unwrap();
+            (i.CurrentUsage >> 20) as i64
+        };
+
+        // the placements: (name, buffer, its state now, GB/s of the CPU's writes that filled it,
+        // MiB of video memory it took)
+        let mut placed: Vec<(&str, ID3D12Resource, D3D12_RESOURCE_STATES, f64, i64)> = Vec::new();
+        let mut before = vram_mib();
+        let host = VirtualAlloc(std::ptr::null(), BYTES, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE);
+        assert!(!host.is_null(), "VirtualAlloc");
+        let host_gbs = fill(host as *mut u32);
+        let dev3: ID3D12Device3 = dev.cast().unwrap();
+        let host_heap: ID3D12Heap = dev3.OpenExistingHeapFromAddress(host as *const std::ffi::c_void).unwrap();
+        let mut r: Option<ID3D12Resource> = None;
+        dev.CreatePlacedResource(&host_heap, 0, &desc(BYTES as u64, uav | D3D12_RESOURCE_FLAG_ALLOW_CROSS_ADAPTER), D3D12_RESOURCE_STATE_COMMON, None, &mut r).unwrap();
+        placed.push(("host, imported (coherent window)", r.unwrap(), D3D12_RESOURCE_STATE_COMMON, host_gbs, vram_mib() - before));
+        before = vram_mib();
+        let wc = D3D12_HEAP_PROPERTIES { Type: D3D12_HEAP_TYPE_CUSTOM, CPUPageProperty: D3D12_CPU_PAGE_PROPERTY_WRITE_COMBINE, MemoryPoolPreference: D3D12_MEMORY_POOL_L0, ..Default::default() };
+        match committed(wc, BYTES as u64, uav, D3D12_RESOURCE_STATE_COMMON) {
+            Ok(r) => {
+                let gbs = mapped_fill(&r);
+                placed.push(("host, write-combined custom heap", r, D3D12_RESOURCE_STATE_COMMON, gbs, vram_mib() - before));
+            }
+            Err(e) => println!("host, write-combined custom heap: {e}"),
+        }
+        before = vram_mib();
+        let vram = committed(heap_type(D3D12_HEAP_TYPE_DEFAULT), BYTES as u64, uav, D3D12_RESOURCE_STATE_COPY_DEST).unwrap();
+        let upload = committed(heap_type(D3D12_HEAP_TYPE_UPLOAD), BYTES as u64, D3D12_RESOURCE_FLAG_NONE, D3D12_RESOURCE_STATE_GENERIC_READ).unwrap();
+        // the CPU writes an upload heap, which is copied (its video memory counted with the default heap's)
+        let gbs = mapped_fill(&upload);
+        placed.push(("video memory, default heap", vram.clone(), D3D12_RESOURCE_STATE_COPY_DEST, gbs, vram_mib() - before));
+        before = vram_mib();
+        let mut o16 = D3D12_FEATURE_DATA_D3D12_OPTIONS16::default();
+        let gpu_upload = dev.CheckFeatureSupport(D3D12_FEATURE_D3D12_OPTIONS16, &mut o16 as *mut _ as _, std::mem::size_of_val(&o16) as u32).is_ok() && o16.GPUUploadHeapSupported.as_bool();
+        if gpu_upload {
+            match committed(heap_type(D3D12_HEAP_TYPE_GPU_UPLOAD), BYTES as u64, uav, D3D12_RESOURCE_STATE_COMMON) {
+                Ok(r) => {
+                    let gbs = mapped_fill(&r);
+                    placed.push(("video memory, GPU upload heap", r, D3D12_RESOURCE_STATE_COMMON, gbs, vram_mib() - before));
+                }
+                Err(e) => println!("video memory, GPU upload heap: {e}"),
+            }
+        }
+
+        let out = committed(heap_type(D3D12_HEAP_TYPE_DEFAULT), OUT, uav, D3D12_RESOURCE_STATE_UNORDERED_ACCESS).unwrap();
+        let readback = committed(heap_type(D3D12_HEAP_TYPE_READBACK), OUT, D3D12_RESOURCE_FLAG_NONE, D3D12_RESOURCE_STATE_COPY_DEST).unwrap();
+        let stamps_n = 2 * REPS as u32;
+        let stamps = committed(heap_type(D3D12_HEAP_TYPE_READBACK), 8 * stamps_n as u64, D3D12_RESOURCE_FLAG_NONE, D3D12_RESOURCE_STATE_COPY_DEST).unwrap();
+        let mut qh: Option<ID3D12QueryHeap> = None;
+        dev.CreateQueryHeap(&D3D12_QUERY_HEAP_DESC { Type: D3D12_QUERY_HEAP_TYPE_TIMESTAMP, Count: stamps_n, NodeMask: 0 }, &mut qh).unwrap();
+        let qh = qh.unwrap();
+        let hz = queue.GetTimestampFrequency().unwrap() as f64;
+        let alloc: ID3D12CommandAllocator = dev.CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT).unwrap();
+        let fence: ID3D12Fence = dev.CreateFence(0, D3D12_FENCE_FLAG_NONE).unwrap();
+        let mut value = 0u64;
+        let mut submit = |record: &dyn Fn(&ID3D12GraphicsCommandList)| {
+            alloc.Reset().unwrap();
+            let list: ID3D12GraphicsCommandList = dev.CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT, &alloc, &psos[0].0).unwrap();
+            record(&list);
+            list.Close().unwrap();
+            queue.ExecuteCommandLists(&[Some(list.cast().unwrap())]);
+            value += 1;
+            queue.Signal(&fence, value).unwrap();
+            crate::gpu::fence::wait(&fence, value, &dev, None, 120_000).unwrap_or_else(|e| panic!("{e}"));
+        };
+        submit(&|l| {
+            l.CopyBufferRegion(&vram, 0, &upload, 0, BYTES as u64);
+            for (_, r, state, ..) in &placed {
+                l.ResourceBarrier(&[transition(r, *state, D3D12_RESOURCE_STATE_UNORDERED_ACCESS)]);
+            }
+        });
+        drop(upload);
+
+        // (what, mask, groups, iterations); no mask: the streaming read
+        let cases: [(&str, u32, u32, u32); 4] = [
+            ("chain in 64 KiB, 1 group", 0x3FFF, 1, 4096),
+            ("chain in 64 KiB, 1024 groups", 0x3FFF, 1024, 4096),
+            ("chain in 256 MiB, 1024 groups", WORDS as u32 - 1, 1024, 512),
+            ("stream 256 MiB", 0, 1024, 0),
+        ];
+        println!("GPU: {} / GPU upload heap: {}", crate::gpu::adapter::name(&adesc), if gpu_upload { "yes" } else { "no" });
+        for (name, mem, _, cpu_gbs, mib) in &placed {
+            let mut cells = Vec::new();
+            for &(_, mask, groups, iters) in &cases {
+                let mut views = Vec::new();
+                for (chase, stream) in &psos {
+                    let (pso, consts) = if mask == 0 { (stream, [0, 0, WORDS as u32, 0]) } else { (chase, [mask, iters, 0, 0]) };
+                    submit(&|l| {
+                        l.SetComputeRootSignature(&rs);
+                        l.SetPipelineState(pso);
+                        l.SetComputeRoot32BitConstants(0, 4, consts.as_ptr() as _, 0);
+                        l.SetComputeRootUnorderedAccessView(1, mem.GetGPUVirtualAddress());
+                        l.SetComputeRootUnorderedAccessView(2, out.GetGPUVirtualAddress());
+                        l.Dispatch(groups, 1, 1); // warm-up
+                        for k in 0..REPS as u32 {
+                            l.ResourceBarrier(&[uav_barrier(&out)]);
+                            l.EndQuery(&qh, D3D12_QUERY_TYPE_TIMESTAMP, 2 * k);
+                            l.Dispatch(groups, 1, 1);
+                            l.EndQuery(&qh, D3D12_QUERY_TYPE_TIMESTAMP, 2 * k + 1);
+                        }
+                        l.ResolveQueryData(&qh, D3D12_QUERY_TYPE_TIMESTAMP, 0, stamps_n, &stamps, 0);
+                        l.ResourceBarrier(&[transition(&out, D3D12_RESOURCE_STATE_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_COPY_SOURCE)]);
+                        l.CopyBufferRegion(&readback, 0, &out, 0, OUT);
+                        l.ResourceBarrier(&[transition(&out, D3D12_RESOURCE_STATE_COPY_SOURCE, D3D12_RESOURCE_STATE_UNORDERED_ACCESS)]);
+                    });
+                    let mut p = std::ptr::null_mut();
+                    stamps.Map(0, None, Some(&mut p)).unwrap();
+                    let ticks = std::slice::from_raw_parts(p as *const u64, stamps_n as usize);
+                    let mut ms: Vec<f64> = ticks.chunks(2).map(|c| c[1].saturating_sub(c[0]) as f64 * 1000.0 / hz).collect();
+                    stamps.Unmap(0, None);
+                    ms.sort_by(f64::total_cmp);
+                    let ms = ms[ms.len() / 2];
+                    if mask == 0 {
+                        views.push(format!("{:.2} ms ({:.1} GB/s)", ms, BYTES as f64 / (ms * 1e6)));
+                        continue;
+                    }
+                    readback.Map(0, None, Some(&mut p)).unwrap();
+                    let ends = std::slice::from_raw_parts(p as *const u32, groups as usize).to_vec();
+                    readback.Unmap(0, None);
+                    for (g, &end) in ends.iter().enumerate() {
+                        let want = (0..iters).fold((g as u32).wrapping_mul(4099) & mask, |p, _| step(p) & mask);
+                        assert_eq!(end, want, "{name}: the chain of group {g} ended elsewhere");
+                    }
+                    views.push(format!("{:.2} ms ({:.0} ns a load)", ms, ms * 1e6 / iters as f64));
+                }
+                cells.push(format!("{}; globallycoherent {}", views[0], views[1]));
+            }
+            println!("{name} ({mib} MiB of video memory; the CPU wrote it at {cpu_gbs:.1} GB/s):");
+            for ((what, ..), cell) in cases.iter().zip(&cells) {
+                println!("  {what}: {cell}");
+            }
+        }
+        drop(placed);
+        drop(host_heap);
+        VirtualFree(host, 0, MEM_RELEASE);
+    }
+}
+
 /// TG_SIZE (the SGPR after the group ids): the group's wave count | the thread's wave index
 /// << 6. A group that is not a multiple of the wave size has a last, partial wave: 96 threads
 /// are 2 console waves of 64 (3 of 32), not 96 / 64 = 1.
