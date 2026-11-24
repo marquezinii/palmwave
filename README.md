@@ -1,19 +1,41 @@
-# Palmwave
+<p align="center">
+  <img src="assets/palmwave-logo.png" alt="Palmwave logo, a palm tree and a wave forming the letter P" width="360">
+</p>
+
+<h1 align="center">Palmwave</h1>
+<p align="center"><strong>From console code to a PC frame.</strong></p>
+<p align="center">Xbox Series X|S titles on Windows x64 · Direct3D 12 · RDNA2 → DXIL</p>
+<p align="center">
+  <a href="https://realmoon.ai">Made with Moon AI</a> ·
+  <a href="#status">Status</a> ·
+  <a href="#getting-started">Getting started</a> ·
+  <a href="https://github.com/fablinoo/palmwave/issues">Issues</a>
+</p>
 
 Palmwave is a Windows compatibility layer that runs an Xbox Series X|S title
-natively, from files the user supplies. The title's x86-64 code runs unchanged
-inside our process; Palmwave supplies the platform underneath it and converts
-the title's data, ahead of time where it can and on first use where it must
-(shaders). See [docs/architecture.md](docs/architecture.md).
+natively, from files the user supplies. It is made with **Moon AI**, the AI
+platform created by **Stellarr Studio**. The title's x86-64 code runs unchanged
+inside our process; Palmwave supplies the platform underneath it and recompiles
+the console's shaders to DXIL for Direct3D 12, ahead of time where it can and on
+first use where it must. See [docs/architecture.md](docs/architecture.md).
 
 **This repository contains no game files, code or assets.** You need your own
 copy of the title.
 
-## Status (2026-11-25)
+## Status
+
+<p align="center">
+  <img alt="Stage: in game" src="https://img.shields.io/badge/stage-in%20game-1f883d?style=for-the-badge">
+  <img alt="World: drawn" src="https://img.shields.io/badge/world-drawn-1f883d?style=for-the-badge">
+  <img alt="Lighting: in progress" src="https://img.shields.io/badge/lighting-in%20progress-bf8700?style=for-the-badge">
+  <img alt="Speed: 2.5 to 4 fps" src="https://img.shields.io/badge/speed-2.5%E2%80%934%20fps-bf8700?style=for-the-badge">
+  <img alt="Playable: not yet" src="https://img.shields.io/badge/playable-not%20yet-6e7781?style=for-the-badge">
+</p>
 
 **Not playable yet: 2.5 to 4 frames per second, and shadowed areas are black.**
-Tested on one machine: Windows 11, Intel i7-14700KF, NVIDIA RTX 4070 12 GB,
-32 GB RAM. The Series X profile is used throughout.
+Developed and tested on one machine: Windows 11, NVIDIA RTX 5080 (driver
+621.14), AMD Ryzen 9 9950X3D, 61 GB RAM. The Series X profile is used
+throughout.
 
 | Stage | State |
 |-------|-------|
@@ -165,4 +187,8 @@ title's data folder.
 
 ## License
 
-GPL-3.0-or-later, Copyright (C) 2026 fablinoo. See [LICENSE](LICENSE).
+Palmwave is distributed under **GPL-3.0-or-later**, Copyright (C) 2026
+fablinoo. The Palmwave logo keeps the license under which it was previously
+published. [License](LICENSE) · [Logo license](assets/LICENSE.palmwave-logo)
+
+**AI used:** [realmoon.ai](https://realmoon.ai) (Moon AI)

@@ -18,6 +18,9 @@
 /game/
 /games/
 /assets/
+# The brand assets that ship with the code, not game data.
+!/assets/
+!/assets/**
 /data/
 /dump/
 /dumps/
