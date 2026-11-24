@@ -1168,3 +1168,516 @@ mod tests {
         }
     }
 }
+
+/// What shaders pay to read title memory in each place it can be on this
+/// PC: opened in place (stage 1 of `PALMWAVE_INPLACE`), a host copy in a
+/// shared buffer (`shared_buffer`: write-back pages in pool L0), a copy in
+/// the card's memory (`uav_buffer`), and for comparison a write-combined
+/// custom heap and a GPU upload heap where the driver offers one. Run with
+/// `cargo test --release -p palmwave-gpu -- --ignored --nocapture read_cost`.
+#[cfg(test)]
+mod read_cost {
+    use super::*;
+    use std::mem::{ManuallyDrop, transmute_copy};
+    use windows::Win32::Graphics::Direct3D::D3D_FEATURE_LEVEL_12_0;
+    use windows::Win32::Graphics::Dxgi::*;
+    use windows::core::PCSTR;
+
+    const BYTES: usize = 256 << 20;
+    const WORDS: usize = BYTES / 4;
+    const OUT: u64 = 1 << 20;
+    const REPS: u32 = 7;
+
+    /// The programs: `chase` follows chains of dependent loads (each
+    /// address the value the load before read, as descriptor loads come
+    /// before the loads that use them), `stream` reads the whole buffer.
+    /// `COHERENT` is replaced by nothing or by `globallycoherent`.
+    const SOURCE: &str = r#"
+cbuffer C : register(b0) { uint mask; uint iters; uint words; uint pad; };
+COHERENT RWByteAddressBuffer mem : register(u0);
+RWByteAddressBuffer outb : register(u1);
+#define RS "RootConstants(num32BitConstants=4, b0), UAV(u0), UAV(u1)"
+[RootSignature(RS)] [numthreads(64, 1, 1)]
+void chase(uint3 g : SV_GroupID, uint t : SV_GroupIndex) {
+    uint p = (g.x * 4099u) & mask;
+    [loop] for (uint i = 0; i < iters; i++) p = mem.Load(p * 4) & mask;
+    if (t == 0) outb.Store(g.x * 4, p);
+}
+[RootSignature(RS)] [numthreads(256, 1, 1)]
+void stream(uint3 d : SV_DispatchThreadID) {
+    uint4 s = 0;
+    [loop] for (uint i = d.x * 4; i < words; i += 4 * 256 * 1024) s += mem.Load4(i * 4);
+    outb.Store(d.x * 4, s.x ^ s.y ^ s.z ^ s.w);
+}
+"#;
+
+    /// Word `p` of the table holds the step after `p` of an LCG of full
+    /// period modulo 2^26, so `p & mask` walks one cycle of every
+    /// power-of-two table up to the whole buffer.
+    fn step(p: u32) -> u32 {
+        p.wrapping_mul(1_664_525).wrapping_add(1_013_904_223)
+    }
+
+    /// Writes the table at `at` twice and returns the GB/s of the second
+    /// time (the first touches the pages).
+    ///
+    /// # Safety
+    /// `at` points to `BYTES` writable bytes.
+    unsafe fn table(at: *mut u32) -> f64 {
+        let write = || {
+            for p in 0..WORDS {
+                // SAFETY: inside the caller's `BYTES` bytes.
+                unsafe { std::ptr::write_volatile(at.add(p), step(p as u32) & (WORDS as u32 - 1)) };
+            }
+        };
+        write();
+        let started = std::time::Instant::now();
+        write();
+        BYTES as f64 / started.elapsed().as_secs_f64() / 1e9
+    }
+
+    fn compile(source: &str, entry: &str) -> Vec<u8> {
+        let name = std::ffi::CString::new(entry).unwrap();
+        let (mut code, mut errors): (Option<ID3DBlob>, Option<ID3DBlob>) = (None, None);
+        // SAFETY: the source and names live through the call; then the
+        // blobs' own bytes.
+        unsafe {
+            let made = D3DCompile(
+                source.as_ptr().cast(),
+                source.len(),
+                s!("read_cost"),
+                None,
+                None,
+                PCSTR(name.as_ptr().cast()),
+                s!("cs_5_1"),
+                0,
+                0,
+                &mut code,
+                Some(&mut errors),
+            );
+            if let Err(e) = made {
+                let text = errors.map_or(String::new(), |b| {
+                    String::from_utf8_lossy(std::slice::from_raw_parts(
+                        b.GetBufferPointer().cast::<u8>(),
+                        b.GetBufferSize(),
+                    ))
+                    .into_owned()
+                });
+                panic!("{entry}: {e} {text}");
+            }
+            let code = code.unwrap();
+            std::slice::from_raw_parts(code.GetBufferPointer().cast::<u8>(), code.GetBufferSize())
+                .to_vec()
+        }
+    }
+
+    fn transition(
+        r: &ID3D12Resource,
+        before: D3D12_RESOURCE_STATES,
+        after: D3D12_RESOURCE_STATES,
+    ) -> D3D12_RESOURCE_BARRIER {
+        D3D12_RESOURCE_BARRIER {
+            Type: D3D12_RESOURCE_BARRIER_TYPE_TRANSITION,
+            Flags: D3D12_RESOURCE_BARRIER_FLAG_NONE,
+            Anonymous: D3D12_RESOURCE_BARRIER_0 {
+                Transition: ManuallyDrop::new(D3D12_RESOURCE_TRANSITION_BARRIER {
+                    // SAFETY: a borrowed pointer the barrier does not release.
+                    pResource: unsafe { transmute_copy(r) },
+                    Subresource: D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES,
+                    StateBefore: before,
+                    StateAfter: after,
+                }),
+            },
+        }
+    }
+
+    fn uav_barrier(r: &ID3D12Resource) -> D3D12_RESOURCE_BARRIER {
+        D3D12_RESOURCE_BARRIER {
+            Type: D3D12_RESOURCE_BARRIER_TYPE_UAV,
+            Flags: D3D12_RESOURCE_BARRIER_FLAG_NONE,
+            Anonymous: D3D12_RESOURCE_BARRIER_0 {
+                // SAFETY: a borrowed pointer the barrier does not release.
+                UAV: ManuallyDrop::new(D3D12_RESOURCE_UAV_BARRIER {
+                    pResource: unsafe { transmute_copy(r) },
+                }),
+            },
+        }
+    }
+
+    /// The same 256 MiB read from each place, through a plain view (as the
+    /// translated programs' root views are declared) and through a
+    /// `globallycoherent` one: chains in 64 KiB by one group and by 1024,
+    /// chains over the whole buffer, and a streaming read. GPU time of the
+    /// dispatch (timestamps), median of 7. The chains' ends are checked
+    /// against the CPU's, so each place was really read.
+    #[test]
+    #[ignore = "benchmark: cargo test --release -p palmwave-gpu -- --ignored --nocapture read_cost"]
+    fn read_cost_of_title_memory_by_place() {
+        let mut device: Option<ID3D12Device> = None;
+        // SAFETY: plain device creation on the default adapter, as the host does.
+        if unsafe { D3D12CreateDevice(None, D3D_FEATURE_LEVEL_12_0, &mut device) }.is_err() {
+            eprintln!("no Direct3D 12 device: nothing to measure");
+            return;
+        }
+        let device = device.unwrap();
+        // SAFETY (the rest of the test): plain D3D12 and DXGI calls on
+        // objects of the test's own, and its own allocation.
+        unsafe {
+            let factory: IDXGIFactory4 = CreateDXGIFactory2(DXGI_CREATE_FACTORY_FLAGS(0)).unwrap();
+            let adapter: IDXGIAdapter3 =
+                factory.EnumAdapterByLuid(device.GetAdapterLuid()).unwrap();
+            let desc = adapter.GetDesc1().unwrap();
+            if desc.Flags & DXGI_ADAPTER_FLAG_SOFTWARE.0 as u32 != 0 {
+                eprintln!("the software adapter: nothing to measure");
+                return;
+            }
+            let gpu = String::from_utf16_lossy(&desc.Description)
+                .trim_end_matches('\0')
+                .to_owned();
+            // The card's memory the process uses, in MiB: where the driver
+            // put a place.
+            let local_mib = || {
+                let mut info = DXGI_QUERY_VIDEO_MEMORY_INFO::default();
+                adapter
+                    .QueryVideoMemoryInfo(0, DXGI_MEMORY_SEGMENT_GROUP_LOCAL, &mut info)
+                    .unwrap();
+                (info.CurrentUsage >> 20) as i64
+            };
+
+            // Each program as a plain view and as a coherent one.
+            let views = ["", "globallycoherent "].map(|coherent| {
+                let source = SOURCE.replace("COHERENT ", coherent);
+                (compile(&source, "chase"), compile(&source, "stream"))
+            });
+            let root: ID3D12RootSignature = device.CreateRootSignature(0, &views[0].0).unwrap();
+            let pso = |code: &[u8]| -> ID3D12PipelineState {
+                device
+                    .CreateComputePipelineState(&D3D12_COMPUTE_PIPELINE_STATE_DESC {
+                        pRootSignature: transmute_copy(&root),
+                        CS: D3D12_SHADER_BYTECODE {
+                            pShaderBytecode: code.as_ptr().cast(),
+                            BytecodeLength: code.len(),
+                        },
+                        ..Default::default()
+                    })
+                    .unwrap()
+            };
+            let psos = views
+                .each_ref()
+                .map(|(chase, stream)| (pso(chase), pso(stream)));
+
+            let uav = D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS;
+            let committed = |heap: D3D12_HEAP_PROPERTIES,
+                             size: u64,
+                             flags: D3D12_RESOURCE_FLAGS,
+                             state: D3D12_RESOURCE_STATES| {
+                let mut buffer: Option<ID3D12Resource> = None;
+                device
+                    .CreateCommittedResource(
+                        &heap,
+                        D3D12_HEAP_FLAG_NONE,
+                        &buffer_desc(size, flags),
+                        state,
+                        None,
+                        &mut buffer,
+                    )
+                    .and_then(|()| buffer.ok_or_else(windows::core::Error::empty))
+            };
+            let kind = |kind: D3D12_HEAP_TYPE| D3D12_HEAP_PROPERTIES {
+                Type: kind,
+                ..Default::default()
+            };
+            let custom = |pages: D3D12_CPU_PAGE_PROPERTY| D3D12_HEAP_PROPERTIES {
+                Type: D3D12_HEAP_TYPE_CUSTOM,
+                CPUPageProperty: pages,
+                MemoryPoolPreference: D3D12_MEMORY_POOL_L0,
+                ..Default::default()
+            };
+            let mapped_table = |buffer: &ID3D12Resource| {
+                let mut data = std::ptr::null_mut();
+                buffer.Map(0, None, Some(&mut data)).unwrap();
+                let gbs = table(data.cast());
+                buffer.Unmap(0, None);
+                gbs
+            };
+
+            // The places: (name, buffer, its state now, GB/s of the CPU's
+            // writes that filled it, MiB of the card's memory it took).
+            let mut places: Vec<(&str, ID3D12Resource, D3D12_RESOURCE_STATES, f64, i64)> =
+                Vec::new();
+            let mut before = local_mib();
+            let host = mem::VirtualAlloc(
+                std::ptr::null(),
+                BYTES,
+                mem::MEM_RESERVE | mem::MEM_COMMIT,
+                mem::PAGE_READWRITE,
+            )
+            .cast::<u32>();
+            assert!(!host.is_null(), "VirtualAlloc");
+            let host_gbs = table(host);
+            // Stage 1 opens a part of the title's allocation; the whole one
+            // where the runtime has no `ID3D12Device13`.
+            let (name, from) = if device.cast::<ID3D12Device13>().is_ok() {
+                (
+                    "in place (OpenExistingHeapFromAddress1)",
+                    From::Part(host as usize, BYTES),
+                )
+            } else {
+                (
+                    "in place (OpenExistingHeapFromAddress)",
+                    From::Region(host as usize),
+                )
+            };
+            let heap = open(&device, from).unwrap();
+            places.push((
+                name,
+                place(&device, &heap, 0, BYTES as u64).unwrap(),
+                D3D12_RESOURCE_STATE_COMMON,
+                host_gbs,
+                local_mib() - before,
+            ));
+            before = local_mib();
+            let shared = committed(
+                custom(D3D12_CPU_PAGE_PROPERTY_WRITE_BACK),
+                BYTES as u64,
+                uav,
+                D3D12_RESOURCE_STATE_COMMON,
+            )
+            .unwrap();
+            let gbs = mapped_table(&shared);
+            places.push((
+                "shared buffer (write-back, L0)",
+                shared,
+                D3D12_RESOURCE_STATE_COMMON,
+                gbs,
+                local_mib() - before,
+            ));
+            before = local_mib();
+            match committed(
+                custom(D3D12_CPU_PAGE_PROPERTY_WRITE_COMBINE),
+                BYTES as u64,
+                uav,
+                D3D12_RESOURCE_STATE_COMMON,
+            ) {
+                Ok(buffer) => {
+                    let gbs = mapped_table(&buffer);
+                    places.push((
+                        "write-combined custom heap (L0)",
+                        buffer,
+                        D3D12_RESOURCE_STATE_COMMON,
+                        gbs,
+                        local_mib() - before,
+                    ));
+                }
+                Err(e) => println!("write-combined custom heap (L0): {e}"),
+            }
+            before = local_mib();
+            let card = committed(
+                kind(D3D12_HEAP_TYPE_DEFAULT),
+                BYTES as u64,
+                uav,
+                D3D12_RESOURCE_STATE_COPY_DEST,
+            )
+            .unwrap();
+            let upload = committed(
+                kind(D3D12_HEAP_TYPE_UPLOAD),
+                BYTES as u64,
+                D3D12_RESOURCE_FLAG_NONE,
+                D3D12_RESOURCE_STATE_GENERIC_READ,
+            )
+            .unwrap();
+            // The CPU writes an upload heap that is copied; its memory is
+            // counted with the default heap's.
+            let gbs = mapped_table(&upload);
+            places.push((
+                "card's memory (default heap)",
+                card.clone(),
+                D3D12_RESOURCE_STATE_COPY_DEST,
+                gbs,
+                local_mib() - before,
+            ));
+            before = local_mib();
+            let mut options = D3D12_FEATURE_DATA_D3D12_OPTIONS16::default();
+            let gpu_upload = device
+                .CheckFeatureSupport(
+                    D3D12_FEATURE_D3D12_OPTIONS16,
+                    (&raw mut options).cast(),
+                    size_of_val(&options) as u32,
+                )
+                .is_ok()
+                && options.GPUUploadHeapSupported.as_bool();
+            if gpu_upload {
+                match committed(
+                    kind(D3D12_HEAP_TYPE_GPU_UPLOAD),
+                    BYTES as u64,
+                    uav,
+                    D3D12_RESOURCE_STATE_COMMON,
+                ) {
+                    Ok(buffer) => {
+                        let gbs = mapped_table(&buffer);
+                        places.push((
+                            "card's memory (GPU upload heap)",
+                            buffer,
+                            D3D12_RESOURCE_STATE_COMMON,
+                            gbs,
+                            local_mib() - before,
+                        ));
+                    }
+                    Err(e) => println!("card's memory (GPU upload heap): {e}"),
+                }
+            }
+
+            let out = committed(
+                kind(D3D12_HEAP_TYPE_DEFAULT),
+                OUT,
+                uav,
+                D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
+            )
+            .unwrap();
+            let back = committed(
+                kind(D3D12_HEAP_TYPE_READBACK),
+                OUT,
+                D3D12_RESOURCE_FLAG_NONE,
+                D3D12_RESOURCE_STATE_COPY_DEST,
+            )
+            .unwrap();
+            let stamps_n = 2 * REPS;
+            let stamps = committed(
+                kind(D3D12_HEAP_TYPE_READBACK),
+                8 * u64::from(stamps_n),
+                D3D12_RESOURCE_FLAG_NONE,
+                D3D12_RESOURCE_STATE_COPY_DEST,
+            )
+            .unwrap();
+            let mut query: Option<ID3D12QueryHeap> = None;
+            device
+                .CreateQueryHeap(
+                    &D3D12_QUERY_HEAP_DESC {
+                        Type: D3D12_QUERY_HEAP_TYPE_TIMESTAMP,
+                        Count: stamps_n,
+                        NodeMask: 0,
+                    },
+                    &mut query,
+                )
+                .unwrap();
+            let query = query.unwrap();
+            let mut rig = Rig::new(&device).unwrap();
+            let hz = rig.queue.GetTimestampFrequency().unwrap() as f64;
+            rig.run(|list| {
+                list.CopyBufferRegion(&card, 0, &upload, 0, BYTES as u64);
+                for (_, buffer, state, ..) in &places {
+                    list.ResourceBarrier(&[transition(
+                        buffer,
+                        *state,
+                        D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
+                    )]);
+                }
+            })
+            .unwrap();
+            drop(upload);
+
+            // (what, mask, groups, iterations); no mask: the streaming read.
+            let cases: [(&str, u32, u32, u32); 4] = [
+                ("chain in 64 KiB, 1 group", 0x3FFF, 1, 4096),
+                ("chain in 64 KiB, 1024 groups", 0x3FFF, 1024, 4096),
+                ("chain in 256 MiB, 1024 groups", WORDS as u32 - 1, 1024, 512),
+                ("stream 256 MiB", 0, 1024, 0),
+            ];
+            println!(
+                "GPU: {gpu} / GPU upload heap: {}",
+                if gpu_upload { "yes" } else { "no" }
+            );
+            for (name, buffer, _, cpu_gbs, mib) in &places {
+                let mut cells = Vec::new();
+                for &(_, mask, groups, iters) in &cases {
+                    let mut timed = Vec::new();
+                    for (chase, stream) in &psos {
+                        let (pso, constants) = if mask == 0 {
+                            (stream, [0, 0, WORDS as u32, 0])
+                        } else {
+                            (chase, [mask, iters, 0, 0])
+                        };
+                        rig.run(|list| {
+                            list.SetComputeRootSignature(&root);
+                            list.SetPipelineState(pso);
+                            list.SetComputeRoot32BitConstants(0, 4, constants.as_ptr().cast(), 0);
+                            list.SetComputeRootUnorderedAccessView(
+                                1,
+                                buffer.GetGPUVirtualAddress(),
+                            );
+                            list.SetComputeRootUnorderedAccessView(2, out.GetGPUVirtualAddress());
+                            list.Dispatch(groups, 1, 1); // warm-up
+                            for k in 0..REPS {
+                                list.ResourceBarrier(&[uav_barrier(&out)]);
+                                list.EndQuery(&query, D3D12_QUERY_TYPE_TIMESTAMP, 2 * k);
+                                list.Dispatch(groups, 1, 1);
+                                list.EndQuery(&query, D3D12_QUERY_TYPE_TIMESTAMP, 2 * k + 1);
+                            }
+                            list.ResolveQueryData(
+                                &query,
+                                D3D12_QUERY_TYPE_TIMESTAMP,
+                                0,
+                                stamps_n,
+                                &stamps,
+                                0,
+                            );
+                            list.ResourceBarrier(&[transition(
+                                &out,
+                                D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
+                                D3D12_RESOURCE_STATE_COPY_SOURCE,
+                            )]);
+                            list.CopyBufferRegion(&back, 0, &out, 0, OUT);
+                            list.ResourceBarrier(&[transition(
+                                &out,
+                                D3D12_RESOURCE_STATE_COPY_SOURCE,
+                                D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
+                            )]);
+                        })
+                        .unwrap();
+                        let mut data = std::ptr::null_mut();
+                        stamps.Map(0, None, Some(&mut data)).unwrap();
+                        let ticks =
+                            std::slice::from_raw_parts(data.cast::<u64>(), stamps_n as usize);
+                        let mut ms: Vec<f64> = ticks
+                            .chunks(2)
+                            .map(|c| c[1].saturating_sub(c[0]) as f64 * 1000.0 / hz)
+                            .collect();
+                        stamps.Unmap(0, None);
+                        ms.sort_by(f64::total_cmp);
+                        let ms = ms[ms.len() / 2];
+                        if mask == 0 {
+                            timed.push(format!(
+                                "{ms:.2} ms ({:.1} GB/s)",
+                                BYTES as f64 / (ms * 1e6)
+                            ));
+                            continue;
+                        }
+                        back.Map(0, None, Some(&mut data)).unwrap();
+                        let ends = std::slice::from_raw_parts(data.cast::<u32>(), groups as usize)
+                            .to_vec();
+                        back.Unmap(0, None);
+                        for (g, &end) in ends.iter().enumerate() {
+                            let want = (0..iters)
+                                .fold((g as u32).wrapping_mul(4099) & mask, |p, _| step(p) & mask);
+                            assert_eq!(end, want, "{name}: the chain of group {g} ended elsewhere");
+                        }
+                        timed.push(format!(
+                            "{ms:.2} ms ({:.0} ns a load)",
+                            ms * 1e6 / f64::from(iters)
+                        ));
+                    }
+                    cells.push(format!("{}; globallycoherent {}", timed[0], timed[1]));
+                }
+                println!(
+                    "{name} ({mib} MiB of the card's memory; the CPU wrote it at {cpu_gbs:.1} GB/s):"
+                );
+                for ((what, ..), cell) in cases.iter().zip(&cells) {
+                    println!("  {what}: {cell}");
+                }
+            }
+            drop(places);
+            drop(heap);
+            mem::VirtualFree(host.cast(), 0, mem::MEM_RELEASE);
+        }
+    }
+}
