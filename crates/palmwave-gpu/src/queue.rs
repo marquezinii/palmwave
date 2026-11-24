@@ -799,7 +799,7 @@ extern "system" fn present(
             drawn,
             dispatches,
             dispatched,
-            "frame presented (since the last line: draws and dispatches, and those run on the host)"
+            "title requested a present (since the last line: draws and dispatches, and those run on the host)"
         );
         #[cfg(windows)]
         if frame >= 256 {

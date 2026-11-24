@@ -8,7 +8,9 @@
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::{Mutex, OnceLock};
 
-use windows::Win32::Foundation::{HANDLE, HWND, LPARAM, LRESULT, RECT, WPARAM};
+mod present_timing;
+
+use windows::Win32::Foundation::{HANDLE, HWND, LPARAM, LRESULT, RECT, S_OK, WPARAM};
 use windows::Win32::Graphics::Direct3D::D3D_FEATURE_LEVEL_12_0;
 use windows::Win32::Graphics::Direct3D12::*;
 use windows::Win32::Graphics::Dxgi::Common::*;
@@ -5600,6 +5602,7 @@ const BUFFERS: u32 = 2;
 
 struct Presenter {
     swap_chain: IDXGISwapChain3,
+    last_status: windows::core::HRESULT,
     width: u32,
     height: u32,
     format: DXGI_FORMAT,
@@ -5615,6 +5618,7 @@ struct Presenter {
 /// The frame rate, shown in the window's caption every second and logged
 /// every few seconds.
 struct Meter {
+    timing: Option<present_timing::PresentTiming>,
     since: std::time::Instant,
     frames: u32,
     #[cfg(feature = "diagnostics")]
@@ -5629,6 +5633,7 @@ impl Meter {
     fn new() -> Self {
         let now = std::time::Instant::now();
         Meter {
+            timing: None,
             since: now,
             frames: 0,
             #[cfg(feature = "diagnostics")]
@@ -5644,13 +5649,28 @@ impl Meter {
         #[cfg(feature = "diagnostics")]
         tracing::debug!(target: "palmwave_gpu::frame", token = crate::frame::current(), "present");
         #[cfg(feature = "diagnostics")]
-        crate::copystat::presented();
-        self.frames += 1;
-        #[cfg(feature = "diagnostics")]
         {
+            crate::copystat::presented();
             self.copy_stats_frames += 1;
         }
-        let elapsed = self.since.elapsed();
+        let now = std::time::Instant::now();
+        let Some(timing) = &mut self.timing else {
+            self.timing = Some(present_timing::PresentTiming::new(now));
+            self.since = now;
+            self.drawn = crate::draw::drawn();
+            return;
+        };
+        if let Some(window) = timing.record(now) {
+            let seconds = window.elapsed.as_secs_f64();
+            let millis = |d: std::time::Duration| d.as_secs_f64() * 1000.0;
+            tracing::info!(
+                "host presentation: {} intervals over {:.3} s, {:.2} fps; p95 {:.2} ms, p99 {:.2} ms, max {:.2} ms",
+                window.intervals, seconds, window.intervals as f64 / seconds,
+                millis(window.p95), millis(window.p99), millis(window.max)
+            );
+        }
+        self.frames += 1;
+        let elapsed = now - self.since;
         if elapsed < std::time::Duration::from_secs(1) {
             return;
         }
@@ -5659,7 +5679,7 @@ impl Meter {
         let fps = frames / elapsed.as_secs_f64();
         let ms = elapsed.as_secs_f64() * 1000.0 / frames;
         let draws = (drawn - self.drawn) as f64 / frames;
-        (self.since, self.frames, self.drawn) = (std::time::Instant::now(), 0, drawn);
+        (self.since, self.frames, self.drawn) = (now, 0, drawn);
         // Of a frame, ms preparing submissions and ms waiting for the GPU.
         let [cpu, gpu] = [0, 1].map(|i| {
             SUBMISSION_US[i].swap(0, Ordering::Relaxed) as f64 / 1000.0 / frames
@@ -5967,7 +5987,15 @@ impl Host {
             if let Some((buffer, footprint)) = capture {
                 crate::capture::save_read_back(frame, &buffer, &footprint);
             }
-            let _ = p.swap_chain.Present(0, DXGI_PRESENT(0));
+            let status = p.swap_chain.Present(0, DXGI_PRESENT(0));
+            if status != S_OK {
+                if p.last_status != status {
+                    tracing::warn!(?status, "DXGI present did not display a frame");
+                    p.last_status = status;
+                }
+                return None;
+            }
+            p.last_status = S_OK;
             p.meter.frame(p.hwnd);
             #[cfg(feature = "diagnostics")]
             return Some(probe.is_some_and(|b| crate::capture::black(&b)));
@@ -6010,6 +6038,7 @@ impl Host {
             tracing::info!(width, height, format = format.0, "presenting to a window");
             Ok(Presenter {
                 swap_chain,
+                last_status: S_OK,
                 width,
                 height,
                 format,
